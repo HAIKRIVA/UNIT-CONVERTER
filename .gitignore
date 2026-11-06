@@ -21,3 +21,6 @@ packages/translations/lib/app_localizations*.dart
 pubspec_overrides.yaml
 assets/*/*.svg.vec
 *.g.dart
+
+.github/workflows/
+
