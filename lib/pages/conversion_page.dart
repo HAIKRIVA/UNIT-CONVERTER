@@ -1,0 +1,605 @@
+import 'dart:async';
+
+import 'package:converterpro/app_router.dart';
+import 'package:converterpro/helpers/responsive_helper.dart';
+import 'package:converterpro/models/conversions.dart';
+import 'package:converterpro/models/currencies.dart';
+import 'package:converterpro/models/hide_units.dart';
+import 'package:converterpro/models/settings.dart';
+import 'package:converterpro/utils/utils_widgets.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_riverpod/legacy.dart';
+import 'package:flutter_svg/flutter_svg.dart';
+import 'package:translations/app_localizations.dart';
+import 'package:converterpro/utils/utils.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:converterpro/data/property_unit_maps.dart';
+import 'package:converterpro/models/order.dart';
+import 'package:converterpro/utils/number_format.dart';
+import 'package:intl/intl.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
+import 'package:reorderable_grid/reorderable_grid.dart';
+import 'package:vector_graphics/vector_graphics.dart';
+
+/// True while a forced currencies download triggered by tapping the last
+/// update date is in progress (used to show a progress indicator).
+final _isCurrenciesUpdatingProvider = StateProvider<bool>((ref) => false);
+
+class ConversionPage extends ConsumerStatefulWidget {
+  final PROPERTYX property;
+
+  /// The unit (e.g. 'atmospheres') selected from the search page, that will
+  /// be scrolled to and highlighted. Null when the page is opened normally.
+  final String? targetUnit;
+
+  const ConversionPage(this.property, {this.targetUnit, super.key});
+
+  @override
+  ConsumerState<ConversionPage> createState() => _ConversionPageState();
+}
+
+class _ConversionPageState extends ConsumerState<ConversionPage> {
+  /// Whether the units are being reordered: shows the drag/visibility handles.
+  bool _isEditingUnits = false;
+
+  @override
+  void didUpdateWidget(covariant ConversionPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.property != widget.property) {
+      _isEditingUnits = false;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final PROPERTYX property = widget.property;
+    final String? targetUnit = widget.targetUnit;
+
+    // if we remove the following check, if you enter the site directly to
+    // '/conversions/:property' an error will occur
+    if (!ref.watch(isEverythingLoadedProvider)) {
+      return const SplashScreenWidget();
+    }
+
+    final l10n = AppLocalizations.of(context)!;
+
+    final heroEnabled = ref.watch(conversionPageHeroEnabledProvider);
+
+    final decimalSeparator = ref.watch(decimalSeparatorProvider);
+    final groupingSeparator = ref.watch(groupingSeparatorProvider);
+    final thousandsSeparator =
+        ref.watch(thousandsSeparatorProvider).value ?? true;
+
+    final unitsOrder = ref
+        .watch(UnitsOrderNotifier.provider)
+        .value![property]!;
+    final unorderedUnitData = ref
+        .watch(ConversionsNotifier.provider)
+        .value![property]!;
+    // Apply the order synchronously: ConversionsNotifier rebuilds
+    // asynchronously, which would make the units flash back to their previous
+    // position right after a drag.
+    final unitDataByUnit = {
+      for (final unitData in unorderedUnitData) unitData.unit.name: unitData,
+    };
+    final unitDataList = unitsOrder
+        .map((unit) => unitDataByUnit[unit]!)
+        .toList();
+    final propertyUiMap = getPropertyUiMap(context);
+    final unitMap = getUnitUiMap(context)[property]!;
+    final hiddenUnits = ref
+        .watch(HiddenUnitsNotifier.provider)
+        .value![property]!;
+    final hiddenUnitData = unitDataList
+        .where((e) => hiddenUnits.contains(e.unit.name))
+        .toList();
+    final unhiddenUnitData = unitDataList
+        .where((e) => !hiddenUnits.contains(e.unit.name))
+        .toList();
+
+    // The unit selected from the search page (query parameter 'unit'), if it
+    // belongs to this property. The parameter carries only the unit
+    // identifier (e.g. 'atmospheres' or 'USD'), which is unique within the
+    // property. Currencies are identified by a plain string, all other units
+    // by an enum.
+    UnitData? targetUnitData;
+    if (targetUnit != null) {
+      for (final unitData in unitDataList) {
+        final dynamic unitName = unitData.unit.name;
+        final bool matches = unitName is Enum
+            ? unitName.name == targetUnit
+            : unitName.toString() == targetUnit;
+        if (matches) {
+          targetUnitData = unitData;
+          break;
+        }
+      }
+    }
+
+    Widget? subtitleWidget;
+    if (property == PROPERTYX.currencies) {
+      Currencies? currencies = ref.watch(CurrenciesNotifier.provider).value;
+      final isUpdating = ref.watch(_isCurrenciesUpdatingProvider);
+      subtitleWidget = currencies == null || isUpdating
+          ? const SizedBox(
+              height: 32,
+              width: 32,
+              child: Padding(
+                padding: EdgeInsets.all(4),
+                child: CircularProgressIndicator(),
+              ),
+            )
+          : FilledButton.tonal(
+              onPressed: () => _forceCurrenciesUpdate(context, ref),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                spacing: 4,
+                children: [
+                  Text(
+                    _getLastUpdateString(
+                      context,
+                      ref.watch(actualLocaleProvider)!,
+                      currencies.lastUpdate,
+                    ),
+                    style: Theme.of(context).textTheme.titleSmall,
+                  ),
+                  if (currencies.downloadError != null)
+                    Icon(
+                      Icons.error_outline,
+                      size: 20,
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                ],
+              ),
+            );
+    }
+
+    UnitWidget unitWidgetBuilder(
+      UnitData unitData, {
+      Widget? dragHandle,
+      bool isHidden = false,
+    }) => UnitWidget(
+      // When this is the unit selected from the search page, the [ValueKey]
+      // is moved onto the wrapping [_TargetUnitReveal], so that the reorder
+      // package still sees a [ValueKey] on the direct child.
+      key: identical(unitData, targetUnitData)
+          ? null
+          : ValueKey('unit-${unitData.unit.name}'),
+      tffKey: unitData.unit.name.toString(),
+      unitName: unitMap[unitData.unit.name]!,
+      unitSymbol: unitData.unit.symbol,
+      symbolContainsIcon: unitData.property == PROPERTYX.currencies,
+      keyboardType: unitData.textInputType,
+      controller: unitData.tec,
+      focusNode: unitData.fn,
+      inputFormatters: unitData.property == PROPERTYX.numeralSystems
+          ? unitData.validator == VALIDATOR.binary
+                ? [BinaryGroupingFormatter(grouping: thousandsSeparator)]
+                : null
+          : [
+              ThousandsSeparatorFormatter(
+                decimalSeparator: decimalSeparator,
+                groupingSeparator: thousandsSeparator
+                    ? groupingSeparator
+                    : null,
+              ),
+            ],
+      isEditing: _isEditingUnits,
+      dragHandle: dragHandle,
+      visibilityHandle: IconButton(
+        key: ValueKey('unitVisibilityHandle-${unitData.unit.name}'),
+        tooltip: isHidden ? l10n.showUnit : l10n.hideUnit,
+        icon: Icon(
+          isHidden ? Icons.visibility_outlined : Icons.visibility_off_outlined,
+        ),
+        onPressed: () {
+          unitData.fn.unfocus();
+          ref
+              .read(HiddenUnitsNotifier.provider.notifier)
+              .set(
+                isHidden
+                    ? hiddenUnits.where((e) => e != unitData.unit.name).toList()
+                    : [...hiddenUnits, unitData.unit.name],
+                property,
+              );
+        },
+      ),
+      validator: (String? input) {
+        if (input != null && input != '') {
+          final normalizedInput =
+              unitData.property == PROPERTYX.numeralSystems
+              ? input.replaceAll(' ', '')
+              : stripGroupingSeparator(
+                  input,
+                  thousandsSeparator ? groupingSeparator : null,
+                ).replaceAll(decimalSeparator, '.');
+          if (!unitData.getValidator().hasMatch(normalizedInput)) {
+            return l10n.invalidCharacters;
+          }
+        }
+        return null;
+      },
+      onChanged: (String txt) {
+        final normalizedTxt = unitData.property == PROPERTYX.numeralSystems
+            ? txt.replaceAll(' ', '')
+            : stripGroupingSeparator(
+                txt,
+                thousandsSeparator ? groupingSeparator : null,
+              ).replaceAll(decimalSeparator, '.');
+        if (normalizedTxt == '' ||
+            unitData.getValidator().hasMatch(normalizedTxt)) {
+          var conversions = ref.read(ConversionsNotifier.provider.notifier);
+          //just numeral system uses a string for conversion
+          if (unitData.property == PROPERTYX.numeralSystems) {
+            conversions.convert(
+              unitData,
+              normalizedTxt == "" ? null : normalizedTxt,
+              property,
+            );
+          } else {
+            conversions.convert(
+              unitData,
+              normalizedTxt == "" ? null : double.parse(normalizedTxt),
+              property,
+            );
+          }
+        }
+      },
+    );
+
+    return ValueListenableBuilder<TextEditingValue>(
+      valueListenable: unitDataList[0].tec,
+      builder: (context, textValue, child) {
+        return LayoutBuilder(
+          builder: (BuildContext context, BoxConstraints constraint) {
+            final int numCols = responsiveNumCols(constraint.maxWidth);
+            return CustomScrollView(
+              // Build all units even when off-screen: the search page needs to
+              // reveal a unit that can be far down the grid.
+              scrollCacheExtent: const ScrollCacheExtent.pixels(10000),
+              slivers: <Widget>[
+                SliverAppBar.large(
+                  title: Builder(
+                    builder: (context) {
+                      final isExpanded =
+                          (DefaultTextStyle.of(context).style.fontSize ??
+                              22.0) >
+                          24.0;
+                      final iconWidget = SvgPicture(
+                        AssetBytesLoader(propertyUiMap[property]!.selectedIcon),
+                        width: 24,
+                        colorFilter: ColorFilter.mode(
+                          Theme.of(context).textTheme.titleLarge!.color!,
+                          BlendMode.srcIn,
+                        ),
+                      );
+                      final textWidget = Material(
+                        type: MaterialType.transparency,
+                        child: Text(
+                          propertyUiMap[property]!.name,
+                          style: Theme.of(context).textTheme.headlineMedium,
+                        ),
+                      );
+                      return Row(
+                        spacing: 12,
+                        children: [
+                          isExpanded
+                              ? HeroMode(
+                                  enabled: heroEnabled,
+                                  child: Hero(
+                                    tag: 'icon-${property.toString()}',
+                                    child: iconWidget,
+                                  ),
+                                )
+                              : iconWidget,
+                          isExpanded
+                              ? HeroMode(
+                                  enabled: heroEnabled,
+                                  child: Hero(
+                                    tag: 'text-${property.toString()}',
+                                    child: textWidget,
+                                  ),
+                                )
+                              : textWidget,
+                        ],
+                      );
+                    },
+                  ),
+                  actions: <Widget>[
+                    IconButton(
+                      key: ValueKey(
+                        _isEditingUnits ? 'saveUnits' : 'editUnits',
+                      ),
+                      tooltip: _isEditingUnits ? l10n.save : l10n.reorderUnits,
+                      icon: Icon(
+                        _isEditingUnits ? Icons.check : Icons.edit_outlined,
+                      ),
+                      onPressed: () {
+                        FocusScope.of(context).unfocus();
+                        setState(() => _isEditingUnits = !_isEditingUnits);
+                      },
+                    ),
+                  ],
+                ),
+                if (subtitleWidget != null)
+                  SliverToBoxAdapter(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 15),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [subtitleWidget],
+                      ),
+                    ),
+                  ),
+                SliverPadding(
+                  padding: const EdgeInsets.only(top: 10),
+                  sliver: SliverReorderableGrid(
+                    itemCount: unhiddenUnitData.length,
+                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: numCols,
+                      childAspectRatio: responsiveChildAspectRatio(
+                        constraint.maxWidth,
+                        numCols,
+                      ),
+                    ),
+                    itemDragEnable: (int index) => _isEditingUnits,
+                    onReorderStart: (int index) =>
+                        HapticFeedback.selectionClick(),
+                    onReorder: (int oldIndex, int newIndex) {
+                      ref
+                          .read(UnitsOrderNotifier.provider.notifier)
+                          .reorderUnhidden(
+                            oldIndex,
+                            newIndex,
+                            property,
+                            hiddenUnits,
+                          );
+                    },
+                    itemBuilder: (BuildContext context, int index) {
+                      final unitData = unhiddenUnitData[index];
+                      final unitWidget = unitWidgetBuilder(
+                        unitData,
+                        dragHandle: _UnitDragStartListener(
+                          key: ValueKey(
+                            'unitDragHandle-${unitData.unit.name}',
+                          ),
+                          index: index,
+                          gestureSettings: MediaQuery.maybeGestureSettingsOf(
+                            context,
+                          ),
+                          child: Semantics(
+                            label: l10n.reorderUnits,
+                            child: const Padding(
+                              padding: EdgeInsets.all(8),
+                              child: Icon(Icons.drag_handle),
+                            ),
+                          ),
+                        ),
+                      );
+                      return identical(unitData, targetUnitData)
+                          ? _TargetUnitReveal(
+                              key: ValueKey('unit-${unitData.unit.name}'),
+                              isHidden: false,
+                              child: unitWidget,
+                            )
+                          : unitWidget;
+                    },
+                  ),
+                ),
+                if (hiddenUnitData.isNotEmpty)
+                  SliverToBoxAdapter(
+                    child: Material(
+                      type: MaterialType.transparency,
+                      child: ExpansionTile(
+                        // Keep the hidden units in the tree even when the tile
+                        // is collapsed: this way the unit selected from the
+                        // search page can expand the tile and scroll to itself.
+                        maintainState: true,
+                        leading: const Icon(Icons.visibility_off_outlined),
+                        title: Text(
+                          l10n.hiddenUnits,
+                          style: Theme.of(context).textTheme.titleLarge,
+                        ),
+                        children: [
+                          GridView.builder(
+                            shrinkWrap: true,
+                            physics: const NeverScrollableScrollPhysics(),
+                            gridDelegate:
+                                SliverGridDelegateWithFixedCrossAxisCount(
+                                  crossAxisCount: numCols,
+                                  childAspectRatio: responsiveChildAspectRatio(
+                                    constraint.maxWidth,
+                                    numCols,
+                                  ),
+                                ),
+                            itemCount: hiddenUnitData.length,
+                            itemBuilder: (context, index) {
+                              final unitData = hiddenUnitData[index];
+                              final unitWidget = unitWidgetBuilder(
+                                unitData,
+                                isHidden: true,
+                              );
+                              return identical(unitData, targetUnitData)
+                                  ? _TargetUnitReveal(
+                                      key: ValueKey(
+                                        'unit-${unitData.unit.name}',
+                                      ),
+                                      isHidden: true,
+                                      child: unitWidget,
+                                    )
+                                  : unitWidget;
+                            },
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                if (isDrawerFixed(MediaQuery.sizeOf(context).width) &&
+                    MediaQuery.viewInsetsOf(context).bottom == 0 &&
+                    textValue.text.isNotEmpty)
+                  // Space for FAB + navigation bar (android)
+                  SliverToBoxAdapter(
+                    child: SizedBox(
+                      height: 60 + MediaQuery.paddingOf(context).bottom,
+                    ),
+                  ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+String _getLastUpdateString(
+  BuildContext context,
+  Locale locale,
+  String lastUpdate,
+) {
+  final l10n = AppLocalizations.of(context)!;
+  DateTime lastUpdateCurrencies = DateTime.parse(lastUpdate);
+  DateTime dateNow = DateTime.now();
+  if (lastUpdateCurrencies.day == dateNow.day &&
+      lastUpdateCurrencies.month == dateNow.month &&
+      lastUpdateCurrencies.year == dateNow.year) {
+    return l10n.lastCurrenciesUpdate + l10n.today.toLowerCase();
+  }
+  return l10n.lastCurrenciesUpdate +
+      DateFormat.yMd(locale.toString()).format(lastUpdateCurrencies);
+}
+
+Future<void> _forceCurrenciesUpdate(BuildContext context, WidgetRef ref) async {
+  final updatingNotifier = ref.read(_isCurrenciesUpdatingProvider.notifier);
+  updatingNotifier.state = true;
+  try {
+    await ref
+        .read(CurrenciesNotifier.provider.notifier)
+        .forceCurrenciesDownload();
+  } finally {
+    updatingNotifier.state = false;
+  }
+  if (!context.mounted) return;
+  final error = ref.read(CurrenciesNotifier.provider).value?.downloadError;
+  if (error != null) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(error.toString()),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+  }
+}
+
+/// [ReorderableGridDragStartListener] that passes the platform gesture settings
+/// to its recognizer, like Flutter's own [ReorderableDragStartListener] does.
+///
+/// Without them the recognizer uses the default [kTouchSlop] (18 logical
+/// pixels), while the enclosing scroll view uses the platform touch slop
+/// (about 8 on Android). A vertical drag would then scroll the page instead of
+/// reordering the unit, unless the finger moves sideways first.
+class _UnitDragStartListener extends ReorderableGridDragStartListener {
+  const _UnitDragStartListener({
+    required super.child,
+    required super.index,
+    required this.gestureSettings,
+    super.key,
+  });
+
+  final DeviceGestureSettings? gestureSettings;
+
+  @override
+  MultiDragGestureRecognizer createRecognizer() =>
+      ImmediateMultiDragGestureRecognizer(debugOwner: this)
+        ..gestureSettings = gestureSettings;
+}
+
+/// Wraps the unit selected from the search page: when it first appears, it
+/// scrolls the unit into view (expanding the hidden units tile if needed) and
+/// briefly highlights it.
+class _TargetUnitReveal extends StatefulWidget {
+  final Widget child;
+
+  /// Whether the wrapped unit is inside the hidden units [ExpansionTile].
+  final bool isHidden;
+
+  const _TargetUnitReveal({
+    required this.child,
+    required this.isHidden,
+    super.key,
+  });
+
+  @override
+  State<_TargetUnitReveal> createState() => _TargetUnitRevealState();
+}
+
+class _TargetUnitRevealState extends State<_TargetUnitReveal> {
+  final GlobalKey _unitKey = GlobalKey();
+  bool _highlighted = false;
+  Timer? _highlightTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _reveal());
+  }
+
+  @override
+  void dispose() {
+    _highlightTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _reveal() async {
+    if (widget.isHidden) {
+      // The unit is inside the hidden units ExpansionTile: expand it so that
+      // the unit is actually visible when scrolled to. The controller is the
+      // one automatically created by the tile, reachable because this widget
+      // is below it in the tree.
+      final ExpansibleController? controller = ExpansibleController.maybeOf(
+        context,
+      );
+      if (controller != null && !controller.isExpanded) {
+        controller.expand();
+        // Wait for the expansion animation to complete, so that the position
+        // of the unit inside the tile is final before scrolling to it.
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+      }
+    }
+    if (!mounted) return;
+    final BuildContext? unitContext = _unitKey.currentContext;
+    if (unitContext == null || !unitContext.mounted) return;
+    await Scrollable.ensureVisible(
+      unitContext,
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeInOut,
+      alignment: 0.2,
+    );
+    if (!mounted) return;
+    setState(() => _highlighted = true);
+    _highlightTimer = Timer(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _highlighted = false);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return KeyedSubtree(
+      key: _unitKey,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        decoration: BoxDecoration(
+          color: _highlighted
+              ? Theme.of(context).colorScheme.primaryContainer
+              : null,
+          borderRadius: const BorderRadius.all(Radius.circular(15)),
+        ),
+        child: widget.child,
+      ),
+    );
+  }
+}

@@ -1,0 +1,402 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:integration_test/integration_test.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:converterpro/main.dart' as app;
+import 'utils.dart';
+
+void main() {
+  IntegrationTestWidgetsFlutterBinding.ensureInitialized();
+
+  Future<void> testInit(WidgetTester tester, {bool clearPrefs = true}) async {
+    if (clearPrefs) {
+      await clearPreferences();
+    }
+    app.main();
+    await tester.pumpAndSettle();
+    setWindowSize(800, 700);
+    await tester.pumpAndSettle();
+  }
+
+  group('Common conversions tasks:', () {
+    testWidgets('Change to a new property and perform conversion', (
+      WidgetTester tester,
+    ) async {
+      await testInit(tester);
+      await tester.tap(
+        find.byKey(const ValueKey('drawerItem_PROPERTYX.currencies')),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Currencies'),
+        findsAtLeastNWidgets(2),
+        reason: 'Expected the currencies page',
+      );
+      await tester.tap(find.byKey(const ValueKey('drawerItem_PROPERTYX.area')));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Area'),
+        findsAtLeastNWidgets(2),
+        reason: 'Expected the area page',
+      );
+
+      await tester.enterText(
+        find.byKey(const ValueKey('AREA.squareFeet')),
+        '1000',
+      );
+      await tester.pumpAndSettle();
+
+      expect(
+        getTextFieldText('AREA.hectares'),
+        '0.009290304',
+        reason: 'Conversion error',
+      );
+      expect(
+        getTextFieldText('AREA.squareMeters'),
+        '92.90304',
+        reason: 'Conversion error',
+      );
+
+      await tester.tap(find.byKey(const ValueKey('clearAll')));
+      await tester.pumpAndSettle();
+      expect(
+        getTextFieldText('AREA.squareFeet'),
+        '',
+        reason: 'Text not cleared',
+      );
+      expect(getTextFieldText('AREA.hectares'), '', reason: 'Text not cleared');
+      expect(
+        getTextFieldText('AREA.squareMeters'),
+        '',
+        reason: 'Text not cleared',
+      );
+    });
+  });
+
+  testWidgets('Perform conversion, clear and undo', (
+    WidgetTester tester,
+  ) async {
+    await testInit(tester);
+
+    expect(
+      find.text('Length'),
+      findsAtLeastNWidgets(2),
+      reason: 'Expected the length page',
+    );
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const ValueKey('LENGTH.miles')), '1');
+    await tester.pumpAndSettle();
+
+    expect(
+      getTextFieldText('LENGTH.feet'),
+      '5,280',
+      reason: 'Conversion error',
+    );
+    expect(
+      getTextFieldText('LENGTH.meters'),
+      '1,609.344',
+      reason: 'Conversion error',
+    );
+
+    await tester.tap(find.byKey(const ValueKey('clearAll')));
+    await tester.pumpAndSettle();
+    expect(getTextFieldText('LENGTH.miles'), '', reason: 'Text not cleared');
+    expect(getTextFieldText('LENGTH.feet'), '', reason: 'Text not cleared');
+    expect(getTextFieldText('LENGTH.meters'), '', reason: 'Text not cleared');
+
+    await tester.tap(find.byKey(const ValueKey('undoClearAll')));
+    await tester.pumpAndSettle();
+    expect(
+      getTextFieldText('LENGTH.miles'),
+      '1.0',
+      reason: 'Text not restored',
+    );
+    expect(
+      getTextFieldText('LENGTH.feet'),
+      '5,280.0',
+      reason: 'Text not restored',
+    );
+    expect(
+      getTextFieldText('LENGTH.meters'),
+      '1,609.344',
+      reason: 'Text not restored',
+    );
+  });
+
+  group('Language tasks:', () {
+    testWidgets('Change language', (WidgetTester tester) async {
+      await testInit(tester);
+      await tester.tap(find.byKey(const ValueKey('drawerItem_settings')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('language-dropdown')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Italiano').last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Lunghezza'));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Lunghezza'),
+        findsAtLeastNWidgets(2),
+        reason: 'Expected translated string',
+      );
+    });
+    testWidgets('Check if language has been saved', (
+      WidgetTester tester,
+    ) async {
+      await testInit(tester, clearPrefs: false);
+      expect(
+        find.text('Lunghezza'),
+        findsAtLeastNWidgets(2),
+        reason: 'Expected translated string',
+      );
+      await clearPreferences();
+    });
+  });
+
+  group('Reordering tasks:', () {
+    testWidgets('Reorder units', (WidgetTester tester) async {
+      await testInit(tester);
+
+      // At the beginning the ordering is Meters, Centimeters, Inches, ...
+      expect(
+        tester.getCenter(find.text('Meters')).dy <
+                tester.getCenter(find.text('Feet')).dy &&
+            tester.getCenter(find.text('Yards')).dy <
+                tester.getCenter(find.text('Kilometers')).dy,
+        true,
+        reason: 'Initial ordering of length units is not what expected',
+      );
+
+      await reorderUnit(tester, 'LENGTH.meters', 'LENGTH.yards');
+      await reorderUnit(tester, 'LENGTH.kilometers', 'LENGTH.feet');
+      await exitUnitsEditMode(tester);
+
+      // Now the ordering should be Inches, Centimeters, Meters, ...
+      expect(
+        tester.getCenter(find.text('Kilometers')).dy <
+                tester.getCenter(find.text('Feet')).dy &&
+            tester.getCenter(find.text('Feet')).dy <
+                tester.getCenter(find.text('Meters')).dy,
+        true,
+        reason: 'Final ordering of length units is not what expected',
+      );
+    });
+
+    testWidgets('Check if units ordering has been saved', (
+      WidgetTester tester,
+    ) async {
+      await testInit(tester, clearPrefs: false);
+
+      expect(
+        tester.getCenter(find.text('Kilometers')).dy <
+                tester.getCenter(find.text('Feet')).dy &&
+            tester.getCenter(find.text('Feet')).dy <
+                tester.getCenter(find.text('Meters')).dy,
+        true,
+        reason: 'Ordering of length units is not what expected',
+      );
+    });
+
+    testWidgets('Reorder properties', (WidgetTester tester) async {
+      await testInit(tester);
+
+      // At the beginning the ordering is Length, Area, Volume, ...
+      expect(
+        tester
+                    .getCenter(
+                      find.byKey(const ValueKey('drawerItem_PROPERTYX.length')),
+                    )
+                    .dy <
+                tester
+                    .getCenter(
+                      find.byKey(const ValueKey('drawerItem_PROPERTYX.area')),
+                    )
+                    .dy &&
+            tester
+                    .getCenter(
+                      find.byKey(const ValueKey('drawerItem_PROPERTYX.area')),
+                    )
+                    .dy <
+                tester
+                    .getCenter(
+                      find.byKey(const ValueKey('drawerItem_PROPERTYX.volume')),
+                    )
+                    .dy,
+        true,
+        reason: 'Initial ordering of properties is not what expected',
+      );
+
+      await tester.tap(find.byKey(const ValueKey('drawerEditProperties')));
+      await tester.pumpAndSettle();
+
+      await reorderProperty(tester, 'PROPERTYX.length', 'PROPERTYX.currencies');
+      await tester.pumpAndSettle();
+
+      await reorderProperty(tester, 'PROPERTYX.volume', 'PROPERTYX.area');
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const ValueKey('drawerSaveProperties')));
+      await tester.pumpAndSettle();
+
+      // Now the ordering should be Volume, Area, Length, ...
+      expect(
+        tester
+                    .getCenter(
+                      find.byKey(const ValueKey('drawerItem_PROPERTYX.length')),
+                    )
+                    .dy >
+                tester
+                    .getCenter(
+                      find.byKey(const ValueKey('drawerItem_PROPERTYX.area')),
+                    )
+                    .dy &&
+            tester
+                    .getCenter(
+                      find.byKey(const ValueKey('drawerItem_PROPERTYX.area')),
+                    )
+                    .dy >
+                tester
+                    .getCenter(
+                      find.byKey(const ValueKey('drawerItem_PROPERTYX.volume')),
+                    )
+                    .dy,
+        true,
+        reason: 'Final ordering the of properties is not what expected',
+      );
+    });
+
+    testWidgets('Check if properties ordering has been saved', (
+      WidgetTester tester,
+    ) async {
+      await testInit(tester, clearPrefs: false);
+      expect(
+        tester
+                    .getCenter(
+                      find.byKey(const ValueKey('drawerItem_PROPERTYX.length')),
+                    )
+                    .dy >
+                tester
+                    .getCenter(
+                      find.byKey(const ValueKey('drawerItem_PROPERTYX.area')),
+                    )
+                    .dy &&
+            tester
+                    .getCenter(
+                      find.byKey(const ValueKey('drawerItem_PROPERTYX.area')),
+                    )
+                    .dy >
+                tester
+                    .getCenter(
+                      find.byKey(const ValueKey('drawerItem_PROPERTYX.volume')),
+                    )
+                    .dy,
+        true,
+        reason: 'Ordering of the properties is not what expected',
+      );
+    });
+  });
+
+  group('Conversion after reorder:', () {
+    testWidgets('Change the order of properties and units and convert', (
+      WidgetTester tester,
+    ) async {
+      await testInit(tester);
+
+      await tester.tap(find.byKey(const ValueKey('drawerEditProperties')));
+      await tester.pumpAndSettle();
+
+      await reorderProperty(tester, 'PROPERTYX.length', 'PROPERTYX.currencies');
+      await tester.pumpAndSettle();
+
+      await reorderProperty(tester, 'PROPERTYX.volume', 'PROPERTYX.area');
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const ValueKey('drawerSaveProperties')));
+      await tester.pumpAndSettle();
+
+      await tester.tap(
+        find.byKey(const ValueKey('drawerItem_PROPERTYX.length')),
+      );
+      await tester.pumpAndSettle();
+
+      await reorderUnit(tester, 'LENGTH.meters', 'LENGTH.yards');
+      await reorderUnit(tester, 'LENGTH.kilometers', 'LENGTH.feet');
+      await exitUnitsEditMode(tester);
+
+      await tester.enterText(find.byKey(const ValueKey('LENGTH.miles')), '1');
+      await tester.pumpAndSettle();
+
+      expect(
+        getTextFieldText('LENGTH.feet'),
+        '5,280',
+        reason: 'Conversion error',
+      );
+      expect(
+        getTextFieldText('LENGTH.meters'),
+        '1,609.344',
+        reason: 'Conversion error',
+      );
+    });
+
+    testWidgets('Check if it is capable of the same conversion after restart', (
+      WidgetTester tester,
+    ) async {
+      await testInit(tester, clearPrefs: false);
+
+      await tester.tap(find.text('Length'));
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.byKey(const ValueKey('LENGTH.miles')), '1');
+      await tester.pumpAndSettle();
+
+      expect(
+        getTextFieldText('LENGTH.feet'),
+        '5,280',
+        reason: 'Conversion error',
+      );
+      expect(
+        getTextFieldText('LENGTH.meters'),
+        '1,609.344',
+        reason: 'Conversion error',
+      );
+    });
+  });
+
+  group('Search tasks:', () {
+    testWidgets('Search a unit opens its page scrolled to the unit', (
+      WidgetTester tester,
+    ) async {
+      await testInit(tester);
+
+      // The search entry is directly visible in the fixed drawer
+      await tester.tap(find.byKey(const ValueKey('drawerItem_search')));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField).last, 'Pascal');
+      await tester.pumpAndSettle();
+      // The first suggestion tile is covered by the search bar and cannot be
+      // tapped: 'Gigapascal' is the last suggestion of the 'Pascal' query
+      await tester.tap(find.text('Gigapascal'));
+      await tester.pump(const Duration(milliseconds: 500));
+      await tester.pumpAndSettle();
+      // The search page reveals the target unit with some asynchronous steps
+      // (scroll and highlight)
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.text('Pressure'),
+        findsAtLeastNWidgets(2),
+        reason: 'Expected the pressure page',
+      );
+      final rect = tester.getRect(
+        find.byKey(const ValueKey('PRESSURE.gigaPascal')),
+      );
+      expect(
+        rect.top >= 0 &&
+            rect.bottom <=
+                tester.view.physicalSize.height / tester.view.devicePixelRatio,
+        true,
+        reason: 'The searched unit is not visible',
+      );
+    });
+  });
+}

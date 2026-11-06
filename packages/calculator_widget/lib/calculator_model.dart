@@ -1,0 +1,373 @@
+import 'package:decimal/decimal.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_riverpod/legacy.dart';
+import 'dart:math' as math;
+import 'package:rational/rational.dart';
+
+enum OPERATION {
+  product,
+  division,
+  addition,
+  subtraction;
+
+  @override
+  String toString() => switch (this) {
+    product => '×',
+    division => '÷',
+    addition => '+',
+    subtraction => '−',
+  };
+}
+
+/// The decimal separator to display and to submit with the dedicated numpad
+/// button. The default is '.', but the host app can override it (for example
+/// with the separator of the currently selected language, ',' in Italian).
+/// Note that internally the calculator always works with the canonical '.'.
+final decimalSeparatorProvider = Provider<String>((ref) => '.');
+
+/// Returns [text] with '.' replaced by [separator] (and vice versa), so that
+/// a number in canonical form can be displayed with the decimal separator of
+/// the current language
+String swapDecimalSeparator(String text, String separator) {
+  if (separator == '.') return text;
+  return text
+      .replaceAll('.', '\u0000')
+      .replaceAll(separator, '.')
+      .replaceAll('\u0000', separator);
+}
+
+class Calculator extends Notifier<String> {
+  final RegExp _regExpValidatingChar = RegExp(r'^[0-9πe,.+-/=*×÷−]+$');
+  final RegExp _regExpNumber = RegExp(r'^[0-9πe]+$');
+
+  static final provider = NotifierProvider<Calculator, String>(Calculator.new);
+
+  Decimal? _firstNumber;
+  late final Map<String, OPERATION> mapOperation;
+
+  @override
+  String build() {
+    mapOperation = ref.read(selectedOperationProvider.notifier).mapOperation;
+    return '';
+  }
+
+  void submitString(String string) {
+    for (final char in string.split('')) {
+      submitChar(char);
+    }
+  }
+
+  /// With this function you can subit any char from 0-9, [, . + - * / =
+  /// backspace canc]
+  void submitChar(String char) {
+    final String decimalSeparator = ref.read(decimalSeparatorProvider);
+    final bool isDecimalSeparator = char == decimalSeparator;
+    //if string is not valid then return
+    if (!(char.length == 1 &&
+        (_regExpValidatingChar.hasMatch(char) || isDecimalSeparator))) {
+      return;
+    }
+
+    // if it is a number
+    if (_regExpNumber.hasMatch(char)) {
+      if (ref.read(isResultProvider)) {
+        ref.read(isResultProvider.notifier).state = false;
+        ref.read(selectedOperationProvider.notifier).state = null;
+        _firstNumber = null;
+        ref.read(previewResultProvider.notifier).state = '';
+      }
+
+      if (ref.read(endNumberProvider)) {
+        state = '';
+        ref.read(endNumberProvider.notifier).state = false;
+      }
+      if (char == 'π') {
+        state = math.pi.toString();
+      } else if (char == 'e') {
+        state = math.e.toString();
+      } else {
+        // is a number
+        state += char;
+      }
+      // Update preview result if an operation is selected
+      _updatePreviewResult();
+    }
+    //if char is a comma, a dot or the decimal separator of the locale
+    else if (char == '.' || char == ',' || isDecimalSeparator) {
+      // Starting a new number after an operator (e.g. "10 * .1")
+      if (ref.read(endNumberProvider)) {
+        state = '0.';
+        ref.read(endNumberProvider.notifier).state = false;
+        _updatePreviewResult();
+        return;
+      }
+      // if it is already submitted a decimal value ignore it
+      if (state.contains('.') || state.contains(',')) {
+        return;
+      }
+      // if state is empty (e.g. leading dot like ".5"), prepend '0'
+      if (state.isEmpty || state == '-') {
+        state += '0';
+      }
+      state += '.'; //append the point at the end
+    }
+    // If it is the leading minus before the first number
+    else if (char == '-' && state == '' && _firstNumber == null) {
+      state += '-';
+    }
+    // if it is an operator
+    else if (mapOperation.containsKey(char)) {
+      // A lone minus (or any other non-numeric state) is not a valid
+      // operand: ignore the operator instead of trying to parse it.
+      final Decimal? currentNumber = Decimal.tryParse(state);
+      if (currentNumber == null) return;
+
+      if (ref.read(isResultProvider)) {
+        ref.read(isResultProvider.notifier).state = false;
+        ref.read(selectedOperationProvider.notifier).state = null;
+        _firstNumber = null;
+      }
+
+      // if it is the first operation submitted
+      if (state.isNotEmpty &&
+          _firstNumber == null &&
+          ref.read(selectedOperationProvider) == null) {
+        _firstNumber = currentNumber;
+        ref.read(selectedOperationProvider.notifier).state = mapOperation[char];
+        ref.read(endNumberProvider.notifier).state = true;
+      } else if (state.isNotEmpty &&
+          _firstNumber != null &&
+          ref.read(selectedOperationProvider) != null &&
+          !ref.read(endNumberProvider)) {
+        // chained operation
+        // Compute the result with the previous operator
+        _computeResult();
+        ref.read(endNumberProvider.notifier).state = true;
+        ref.read(selectedOperationProvider.notifier).state = mapOperation[char];
+      } else if (state.isNotEmpty &&
+          _firstNumber != null &&
+          ref.read(selectedOperationProvider) != null) {
+        // change of operation
+        ref.read(selectedOperationProvider.notifier).state = mapOperation[char];
+      }
+    }
+    // if it is equal symbol
+    else if (char == '=') {
+      if (_firstNumber != null &&
+          state.isNotEmpty &&
+          ref.read(selectedOperationProvider) != null &&
+          !ref.read(isResultProvider)) {
+        _computeResult();
+        ref.read(isResultProvider.notifier).state = true;
+        ref.read(previewResultProvider.notifier).state = '';
+      } else if (_firstNumber != null &&
+          state.isNotEmpty &&
+          ref.read(selectedOperationProvider) != null &&
+          ref.read(isResultProvider)) {
+        _computeResult();
+        ref.read(previewResultProvider.notifier).state = '';
+      }
+    }
+  }
+
+  /// Given firstNumber, secondNumber and selectedOperation in computes the
+  /// result and put it in currentNumber string
+  void _computeResult() {
+    assert(
+      _firstNumber != null && state.isNotEmpty,
+      'firstNumber is null or state is empty',
+    );
+
+    final previewResult = ref.read(previewResultProvider);
+
+    if (previewResult.isNotEmpty) {
+      final Decimal? result = Decimal.tryParse(previewResult);
+      if (result == null) return;
+      _firstNumber = result;
+      state = previewResult;
+      ref.read(endNumberProvider.notifier).state = true;
+      ref.read(previewResultProvider.notifier).state = '';
+    }
+  }
+
+  /// Computes the preview result without updating the main state.
+  /// This is used to show a preview of the result before the user clicks '='
+  void _updatePreviewResult() {
+    if (_firstNumber != null &&
+        state.isNotEmpty &&
+        ref.read(selectedOperationProvider) != null) {
+      try {
+        final secondNumber = Decimal.parse(state);
+        late Decimal result;
+        result = switch (ref.read(selectedOperationProvider)) {
+          OPERATION.addition => _firstNumber! + secondNumber,
+          OPERATION.subtraction => _firstNumber! - secondNumber,
+          OPERATION.product => _firstNumber! * secondNumber,
+          OPERATION.division => (_firstNumber! / secondNumber).toDecimal(
+            scaleOnInfinitePrecision: 15,
+          ),
+          null => throw Exception('selectedOperation is null'),
+        };
+        ref.read(previewResultProvider.notifier).state = _getStringFromDecimal(
+          result,
+        );
+      } catch (_) {
+        // If parsing fails, clear the preview
+        ref.read(previewResultProvider.notifier).state = '';
+      }
+    } else {
+      ref.read(previewResultProvider.notifier).state = '';
+    }
+  }
+
+  /// This method bring the calculator to the initial state (nothing submitted,
+  /// no selected operation)
+  void clearAll() {
+    state = '';
+    _firstNumber = null;
+    ref.read(selectedOperationProvider.notifier).state = null;
+    ref.read(endNumberProvider.notifier).state = false;
+    ref.read(isResultProvider.notifier).state = false;
+    ref.read(previewResultProvider.notifier).state = '';
+  }
+
+  /// This method delete the last character of currentNumber
+  void deleteLastChar() {
+    if (state.isNotEmpty) {
+      state = state.substring(0, state.length - 1);
+    }
+    // Keep the preview in sync with the (possibly) new second operand.
+    _updatePreviewResult();
+  }
+
+  /// This method either clearAll() or deleteLastChar() depending on the state
+  /// of the calculator.
+  void adaptiveDeleteClear() =>
+      ref.read(endNumberProvider) ? clearAll() : deleteLastChar();
+
+  void percentage() => _unaryOperation(
+    (Decimal x) => _getStringFromRational(x / Decimal.fromInt(100)),
+  );
+
+  /// Computes the square root of currentNumber
+  void squareRoot() => _unaryOperation(
+    (Decimal x) => _getStringFromNum(math.sqrt(x.toDouble())),
+  );
+
+  /// Computes the base-10 logarithm of currentNumber
+  void log10() => _unaryOperation(
+    (Decimal x) => _getStringFromNum((math.log(x.toDouble()) / math.log(10))),
+  );
+
+  /// Computes the square of currentNumber
+  void square() =>
+      _unaryOperation((Decimal x) => _getStringFromDecimal((x * x)));
+
+  /// Computes the natural logarithm (base e) of currentNumber
+  void ln() =>
+      _unaryOperation((Decimal x) => _getStringFromNum(math.log(x.toDouble())));
+
+  /// Computes the reciprocal (multiplicative inverse) of currentNumber
+  void reciprocal() => _unaryOperation(
+    (Decimal x) => x == Decimal.zero
+        ? null
+        : x.inverse.toDecimal(scaleOnInfinitePrecision: 15).toString(),
+  );
+
+  /// Computes the factorial of currentNumber. It is defined only for
+  /// non-negative integers up to [_maxFactorialInput]: any other input is
+  /// ignored.
+  void factorial() => _unaryOperation((Decimal x) {
+    if (!x.isInteger || x < Decimal.zero) return null;
+    final n = x.toBigInt();
+    if (n > BigInt.from(_maxFactorialInput)) return null;
+    return _factorial(n).toString();
+  });
+
+  /// General function that applies to all the unary operations, just pass the
+  /// function. If the operation returns null, the current value is left
+  /// unchanged (invalid input).
+  void _unaryOperation(String? Function(Decimal) operation) {
+    //if it is the first operation submitted
+    if (state.isEmpty) return;
+    if (_firstNumber != null) {
+      // If the previous operation is not completed, compute it before
+      // computing the new unary operation
+      submitChar('=');
+    }
+    final value = Decimal.tryParse(state);
+    if (value == null) return;
+    final result = operation(value);
+    if (result == null) return;
+    // Ignore results that are not finite numbers (e.g. the square root of a
+    // negative number or the logarithm of zero).
+    if (Decimal.tryParse(result) == null) return;
+    state = result;
+    ref.read(endNumberProvider.notifier).state = true;
+    ref.read(isResultProvider.notifier).state = true;
+  }
+}
+
+String _getStringFromRational(Rational rational) {
+  final double value = rational.numerator / rational.denominator;
+  // Fall back to the exact decimal representation when the value is outside
+  // the range of double, so that 'Infinity' is never displayed.
+  String stringValue = value.isFinite
+      ? value.toString()
+      : rational.toDecimal().toString();
+  if (stringValue.endsWith('.0')) {
+    stringValue = stringValue.substring(0, stringValue.length - 2);
+  }
+  return stringValue;
+}
+
+String _getStringFromDecimal(Decimal value) =>
+    _getStringFromRational(value.toRational());
+
+String _getStringFromNum(num value) {
+  String stringValue = value.toString();
+  if (stringValue.endsWith('.0')) {
+    stringValue = stringValue.substring(0, stringValue.length - 2);
+  }
+  return stringValue;
+}
+
+/// The largest input accepted by [Calculator.factorial]. Bigger results would
+/// be too long to display and would make the UI freeze.
+const int _maxFactorialInput = 170;
+
+/// Iterative (to avoid stack overflows) and based on [BigInt] (to avoid the
+/// silent overflows of [int] for large inputs).
+BigInt _factorial(BigInt n) {
+  var result = BigInt.one;
+  for (var i = BigInt.two; i <= n; i += BigInt.one) {
+    result *= i;
+  }
+  return result;
+}
+
+class SelectedOperationNotifier extends Notifier<OPERATION?> {
+  static const Map<String, OPERATION> _mapOperation = {
+    '*': OPERATION.product,
+    '/': OPERATION.division,
+    '+': OPERATION.addition,
+    '-': OPERATION.subtraction,
+    '×': OPERATION.product,
+    '÷': OPERATION.division,
+    '−': OPERATION.subtraction,
+  };
+
+  @override
+  OPERATION? build() => null;
+
+  Map<String, OPERATION> get mapOperation => _mapOperation;
+}
+
+final selectedOperationProvider =
+    NotifierProvider<SelectedOperationNotifier, OPERATION?>(
+      () => SelectedOperationNotifier(),
+    );
+
+final endNumberProvider = StateProvider<bool>((ref) => false);
+final isResultProvider = StateProvider<bool>((ref) => false);
+final previewResultProvider = StateProvider<String>((ref) => '');
